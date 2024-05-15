@@ -23,6 +23,7 @@ from marimo._plugins.ui._impl.tables.pandas_table import (
 
 if TYPE_CHECKING:
     import pandas as pd
+    import polars as pl
 
 from dataclasses import dataclass
 
@@ -65,7 +66,7 @@ class GetDataFrameError(Exception):
 
 
 @mddoc
-class dataframe(UIElement[Dict[str, Any], "pd.DataFrame"]):
+class dataframe(UIElement[Dict[str, Any], Any]):
     """
     Run transformations on a DataFrame or series.
     Currently only Pandas DataFrames are supported.
@@ -76,7 +77,7 @@ class dataframe(UIElement[Dict[str, Any], "pd.DataFrame"]):
 
     **Example.**
 
-    ```python
+```python
     dataframe = mo.ui.dataframe(data)
     ```
 
@@ -98,16 +99,27 @@ class dataframe(UIElement[Dict[str, Any], "pd.DataFrame"]):
 
     def __init__(
         self,
-        df: pd.DataFrame,
-        on_change: Optional[Callable[[pd.DataFrame], None]] = None,
+        df: Any,
+        on_change: Optional[Callable[[Any], None]] = None,
         page_size: Optional[int] = 5,
     ) -> None:
-        DependencyManager.require_pandas("to use the dataframe plugin")
-        import pandas as pd
+        if TYPE_CHECKING:
+            import pandas as pd
+            import polars as pl
 
-        if not isinstance(df, pd.DataFrame):
+        if isinstance(df, pd.DataFrame):
+            DependencyManager.require_pandas("to use the dataframe plugin")
+            self._data = df
+            self._manager = PandasTableManagerFactory.create()(df)
+            self._transform_container = TransformsContainer(df)
+        elif isinstance(df, pl.DataFrame):
+            DependencyManager.require_polars("to use the dataframe plugin")
+            self._data = df
+            self._manager = None  # PolarsTableManagerFactory.create()(df)  # Placeholder for Polars manager
+            self._transform_container = TransformsContainer(df)
+        else:
             raise ValueError(
-                "Dataframe plugin only supports Pandas DataFrames"
+                "Dataframe plugin only supports Pandas or Polars DataFrames"
             )
 
         # HACK: this is a hack to get the name of the variable that was passed
@@ -125,9 +137,6 @@ class dataframe(UIElement[Dict[str, Any], "pd.DataFrame"]):
         except Exception:
             pass
 
-        self._data = df
-        self._manager = PandasTableManagerFactory.create()(df)
-        self._transform_container = TransformsContainer(df)
         self._error: Optional[str] = None
 
         super().__init__(
@@ -158,7 +167,10 @@ class dataframe(UIElement[Dict[str, Any], "pd.DataFrame"]):
         )
 
     def _get_column_types(self) -> List[List[Union[str, int]]]:
-        return [[name, dtype] for name, dtype in self._data.dtypes.items()]  # type: ignore
+        if isinstance(self._data, pd.DataFrame):
+            return [[name, dtype] for name, dtype in self._data.dtypes.items()]  # type: ignore
+        elif isinstance(self._data, pl.DataFrame):
+            return [[name, dtype] for name, dtype in zip(self._data.columns, self._data.dtypes)]  # type: ignore
 
     def get_dataframe(self, _args: EmptyArgs) -> GetDataFrameResponse:
         # Only get the first 100 (for performance reasons)
@@ -168,14 +180,23 @@ class dataframe(UIElement[Dict[str, Any], "pd.DataFrame"]):
         if self._error is not None:
             raise GetDataFrameError(self._error)
 
-        manager = PandasTableManagerFactory.create()(self._value.head(LIMIT))
-        url = mo_data.csv(manager.to_csv()).url
+        if isinstance(self._data, pd.DataFrame):
+            manager = PandasTableManagerFactory.create()(self._value.head(LIMIT))
+            url = mo_data.csv(manager.to_csv()).url
+        elif isinstance(self._data, pl.DataFrame):
+            import io
+            csv_buffer = io.BytesIO()
+            self._data.head(LIMIT).write_csv(csv_buffer)
+            url = mo_data.csv(csv_buffer.getvalue()).url
+        else:
+            raise ValueError("Unsupported DataFrame type")
+
         total_rows = len(self._value)
         return GetDataFrameResponse(
             url=url,
             total_rows=total_rows,
             has_more=total_rows > LIMIT,
-            row_headers=manager.get_row_headers(),
+            row_headers=self._manager.get_row_headers() if self._manager else [],
         )
 
     def get_column_values(
@@ -201,7 +222,7 @@ class dataframe(UIElement[Dict[str, Any], "pd.DataFrame"]):
                 too_many_values=True,
             )
 
-    def _convert_value(self, value: Dict[str, Any]) -> pd.DataFrame:
+    def _convert_value(self, value: Dict[str, Any]) -> Any:
         if value is None:
             self._error = None
             return self._data
